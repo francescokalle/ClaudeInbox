@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
 """Strumento email GLOBALE di Claude Code (disponibile in ogni sessione/progetto).
 
-Invia resoconti/notifiche da claude.code@francescocallegaro.com al proprietario
-(mail@francescocallegaro.com) e — se configurata una casella IMAP dedicata —
-legge le risposte.
+Invia resoconti/notifiche dal mittente configurato al proprietario e — se
+configurata una casella IMAP dedicata — legge le risposte. Provider-agnostico:
+host, porte, sicurezza e indirizzi vengono tutti dalla config (nessun default
+personale nel codice).
 
 USO
   # invio
-  python3 ~/.claude/tools/claude_mail.py send "Oggetto" "Corpo"
-  echo "corpo" | python3 ~/.claude/tools/claude_mail.py send "Oggetto"
+  python3 bin/claude_mail.py send "Oggetto" "Corpo"
+  echo "corpo" | python3 bin/claude_mail.py send "Oggetto"
+  python3 bin/claude_mail.py send "Oggetto" "Corpo" --in-reply-to "<msgid>"
 
-  # lettura risposte (richiede IMAP_* configurato in ~/.claude/claude-mail.env,
-  # su una casella DEDICATA a Claude, non la gmail personale)
-  python3 ~/.claude/tools/claude_mail.py fetch [n]
+  # lettura risposte (richiede IMAP_* configurato, su una casella DEDICATA a
+  # Claude, non la posta personale)
+  python3 bin/claude_mail.py fetch [n]
 
-Credenziali: ~/.claude/claude-mail.env (chmod 600, fuori da git).
+Config: ~/.claude/claude-mail.env (chmod 600, fuori da git). Percorso
+sovrascrivibile con la variabile d'ambiente CLAUDEINBOX_ENV.
+Setup guidato: python3 bin/setup_web.py
+
 Quando usarlo: SOLO se l'utente lo chiede o quando lascia un task autonomo /
 dice che va via — a fine lavori inviare un resoconto. Non spammare.
 """
@@ -22,6 +27,7 @@ from __future__ import annotations
 
 import email
 import imaplib
+import os
 import smtplib
 import ssl
 import sys
@@ -30,16 +36,28 @@ from email.mime.text import MIMEText
 from email.utils import formatdate, make_msgid, parseaddr
 from pathlib import Path
 
-ENV = Path.home() / ".claude" / "claude-mail.env"
-SMTP_PORT = 587
-IMAP_PORT = 993
+DEFAULT_ENV = Path.home() / ".claude" / "claude-mail.env"
+DEFAULT_SMTP_PORT = 587
+DEFAULT_IMAP_PORT = 993
 TIMEOUT = 30
 
+# Chiavi note del file di configurazione (usate anche dalla web app di setup).
+SMTP_KEYS = ("SMTP_HOST", "SMTP_PORT", "SMTP_SECURITY", "SMTP_LOGIN", "SMTP_PASSWORD")
+MAIL_KEYS = ("MAIL_SENDER", "MAIL_RECIPIENT")
+IMAP_KEYS = ("IMAP_HOST", "IMAP_PORT", "IMAP_USER", "IMAP_PASSWORD")
+ALL_KEYS = SMTP_KEYS + MAIL_KEYS + IMAP_KEYS
 
-def load_env() -> dict[str, str]:
+
+def env_path() -> Path:
+    override = os.environ.get("CLAUDEINBOX_ENV")
+    return Path(override).expanduser() if override else DEFAULT_ENV
+
+
+def load_env(path: Path | None = None) -> dict[str, str]:
+    path = path or env_path()
     env: dict[str, str] = {}
-    if ENV.exists():
-        for line in ENV.read_text(encoding="utf-8").splitlines():
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
@@ -48,30 +66,94 @@ def load_env() -> dict[str, str]:
     return env
 
 
-def send(subject: str, body: str) -> None:
-    e = load_env()
-    login, pw = e.get("SMTP_LOGIN", ""), e.get("SMTP_PASSWORD", "")
-    sender = e.get("MAIL_SENDER", "claude.code@francescocallegaro.com")
-    recipient = e.get("MAIL_RECIPIENT", "mail@francescocallegaro.com")
-    host = e.get("SMTP_HOST", "smtp.tem.scaleway.com")
-    if not (login and pw):
-        raise SystemExit(f"Credenziali SMTP mancanti in {ENV}")
+def _int(value: str, default: int) -> int:
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def smtp_security(cfg: dict[str, str]) -> str:
+    """'ssl' o 'starttls'. Esplicita se indicata, altrimenti dedotta dalla porta."""
+    sec = (cfg.get("SMTP_SECURITY") or "").strip().lower()
+    if sec in ("ssl", "starttls"):
+        return sec
+    return "ssl" if _int(cfg.get("SMTP_PORT", ""), DEFAULT_SMTP_PORT) == 465 else "starttls"
+
+
+def _open_smtp(cfg: dict[str, str]) -> smtplib.SMTP:
+    host = cfg.get("SMTP_HOST", "").strip()
+    port = _int(cfg.get("SMTP_PORT", ""), DEFAULT_SMTP_PORT)
+    if not host:
+        raise ValueError("SMTP_HOST mancante")
+    ctx = ssl.create_default_context()
+    if smtp_security(cfg) == "ssl":
+        s = smtplib.SMTP_SSL(host, port, timeout=TIMEOUT, context=ctx)
+    else:
+        s = smtplib.SMTP(host, port, timeout=TIMEOUT)
+        s.starttls(context=ctx)
+    login, pw = cfg.get("SMTP_LOGIN", ""), cfg.get("SMTP_PASSWORD", "")
+    if login and pw:
+        s.login(login, pw)
+    return s
+
+
+def verify_smtp(cfg: dict[str, str]) -> tuple[bool, str]:
+    """Testa host+login SMTP senza inviare. Usato dalla web app di setup."""
+    if not (cfg.get("SMTP_HOST") and cfg.get("SMTP_LOGIN") and cfg.get("SMTP_PASSWORD")):
+        return False, "Servono SMTP_HOST, SMTP_LOGIN e SMTP_PASSWORD."
+    try:
+        s = _open_smtp(cfg)
+        try:
+            s.noop()
+        finally:
+            _quiet_quit(s)
+        return True, f"Login SMTP riuscito su {cfg['SMTP_HOST']} ({smtp_security(cfg)})."
+    except Exception as exc:  # noqa: BLE001 — messaggio d'errore leggibile nella UI
+        return False, f"SMTP fallito: {exc}"
+
+
+def verify_imap(cfg: dict[str, str]) -> tuple[bool, str]:
+    """Testa host+login IMAP. Usato dalla web app di setup."""
+    host = cfg.get("IMAP_HOST", "").strip()
+    user, pw = cfg.get("IMAP_USER", ""), cfg.get("IMAP_PASSWORD", "")
+    if not (host and user and pw):
+        return False, "Servono IMAP_HOST, IMAP_USER e IMAP_PASSWORD."
+    port = _int(cfg.get("IMAP_PORT", ""), DEFAULT_IMAP_PORT)
+    try:
+        M = imaplib.IMAP4_SSL(host, port)
+        try:
+            M.login(user, pw)
+            M.select("INBOX")
+        finally:
+            _quiet_logout(M)
+        return True, f"Login IMAP riuscito su {host}."
+    except Exception as exc:  # noqa: BLE001
+        return False, f"IMAP fallito: {exc}"
+
+
+def send(subject: str, body: str, in_reply_to: str | None = None, cfg: dict | None = None) -> None:
+    cfg = cfg or load_env()
+    sender = cfg.get("MAIL_SENDER", "").strip()
+    recipient = cfg.get("MAIL_RECIPIENT", "").strip()
+    if not (cfg.get("SMTP_LOGIN") and cfg.get("SMTP_PASSWORD")):
+        raise SystemExit(f"Credenziali SMTP mancanti in {env_path()}")
+    if not (sender and recipient):
+        raise SystemExit(f"MAIL_SENDER/MAIL_RECIPIENT mancanti in {env_path()}")
     msg = MIMEText(body, "plain", "utf-8")
     msg["Subject"] = subject
     msg["From"] = f"Claude Code <{sender}>"
     msg["To"] = recipient
     msg["Date"] = formatdate(localtime=True)
     msg["Message-ID"] = make_msgid(domain=sender.split("@")[-1])
-    s = smtplib.SMTP(host, SMTP_PORT, timeout=TIMEOUT)
+    if in_reply_to:
+        msg["In-Reply-To"] = in_reply_to
+        msg["References"] = in_reply_to
+    s = _open_smtp(cfg)
     try:
-        s.starttls(context=ssl.create_default_context())
-        s.login(login, pw)
         s.sendmail(sender, [recipient], msg.as_string())
     finally:
-        try:
-            s.quit()
-        except Exception:
-            pass
+        _quiet_quit(s)
     print(f"Email inviata a {recipient}: {subject!r}")
 
 
@@ -104,15 +186,18 @@ def _body_text(m: email.message.Message) -> str:
 
 
 def fetch(limit: int = 5) -> None:
-    e = load_env()
-    host, user, pw = e.get("IMAP_HOST", ""), e.get("IMAP_USER", ""), e.get("IMAP_PASSWORD", "")
+    cfg = load_env()
+    host = cfg.get("IMAP_HOST", "").strip()
+    user, pw = cfg.get("IMAP_USER", ""), cfg.get("IMAP_PASSWORD", "")
     if not (host and user and pw):
         raise SystemExit(
-            "IMAP non configurato. Serve una CASELLA DEDICATA a Claude (non la gmail "
-            "personale): imposta IMAP_HOST/IMAP_USER/IMAP_PASSWORD in ~/.claude/claude-mail.env "
-            "e instrada claude.code@francescocallegaro.com verso quella casella (Cloudflare Email Routing)."
+            "IMAP non configurato. Serve una CASELLA DEDICATA a Claude (non la posta "
+            "personale): imposta IMAP_HOST/IMAP_USER/IMAP_PASSWORD in "
+            f"{env_path()} e instrada le risposte verso quella casella. "
+            "Setup guidato: python3 bin/setup_web.py"
         )
-    M = imaplib.IMAP4_SSL(host, IMAP_PORT)
+    port = _int(cfg.get("IMAP_PORT", ""), DEFAULT_IMAP_PORT)
+    M = imaplib.IMAP4_SSL(host, port)
     try:
         M.login(user, pw)
         M.select("INBOX")
@@ -129,13 +214,42 @@ def fetch(limit: int = 5) -> None:
             print(f"Da: {frm}")
             print(f"Oggetto: {_decode(m.get('Subject'))}")
             print(f"Data: {m.get('Date','')}")
+            print(f"Message-ID: {m.get('Message-ID','').strip()}")
             print("-" * 60)
             print(_body_text(m).strip()[:4000])
     finally:
-        try:
-            M.logout()
-        except Exception:
-            pass
+        _quiet_logout(M)
+
+
+def _quiet_quit(s: smtplib.SMTP) -> None:
+    try:
+        s.quit()
+    except Exception:
+        pass
+
+
+def _quiet_logout(M: imaplib.IMAP4) -> None:
+    try:
+        M.logout()
+    except Exception:
+        pass
+
+
+def _parse_send_args(argv: list[str]) -> tuple[str, str, str | None]:
+    """Estrae oggetto, corpo e --in-reply-to dagli argomenti di `send`."""
+    in_reply_to = None
+    rest: list[str] = []
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--in-reply-to" and i + 1 < len(argv):
+            in_reply_to = argv[i + 1]
+            i += 2
+            continue
+        rest.append(argv[i])
+        i += 1
+    subject = rest[0] if len(rest) >= 1 else "(senza oggetto)"
+    body = rest[1] if len(rest) >= 2 else sys.stdin.read()
+    return subject, body, in_reply_to
 
 
 def main(argv: list[str]) -> int:
@@ -143,9 +257,8 @@ def main(argv: list[str]) -> int:
         print(__doc__)
         return 2
     if argv[1] == "send":
-        subject = argv[2] if len(argv) >= 3 else "(senza oggetto)"
-        body = argv[3] if len(argv) >= 4 else sys.stdin.read()
-        send(subject, body.strip() or "(nessun contenuto)")
+        subject, body, in_reply_to = _parse_send_args(argv[2:])
+        send(subject, body.strip() or "(nessun contenuto)", in_reply_to=in_reply_to)
     else:
         fetch(int(argv[2]) if len(argv) >= 3 else 5)
     return 0
