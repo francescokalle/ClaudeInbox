@@ -1,0 +1,16 @@
+# ClaudeInbox — Email Worker (Cloudflare).
+# Deploy:
+#   cd cloudflare
+#   npx wrangler deploy
+#   npx wrangler secret put RECEIVER_URL     # es. https://inbox.francescocallegaro.com/incoming
+#   npx wrangler secret put RECEIVER_TOKEN   # stesso RECEIVER_TOKEN del receiver
+# Poi, in Cloudflare dashboard -> Email -> Email Routing -> Routing rules:
+#   instrada l'indirizzo (es. claude.code@francescocallegaro.com) su
+#   "Send to a Worker" -> claudeinbox-email.
+
+name = "claudeinbox-email"
+main = "email-worker.js"
+compatibility_date = "2026-08-01"
+
+# Email Worker: attivato dalle email, non da HTTP. Niente rotta workers.dev.
+workers_dev = false

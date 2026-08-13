@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import email
 import imaplib
+import mailbox
 import os
 import smtplib
 import ssl
@@ -39,6 +40,7 @@ from pathlib import Path
 DEFAULT_ENV = Path.home() / ".claude" / "claude-mail.env"
 DEFAULT_SMTP_PORT = 587
 DEFAULT_IMAP_PORT = 993
+DEFAULT_MAILDIR = Path.home() / ".claude" / "claudeinbox-maildir"
 TIMEOUT = 30
 
 # Chiavi note del file di configurazione (usate anche dalla web app di setup).
@@ -46,6 +48,25 @@ SMTP_KEYS = ("SMTP_HOST", "SMTP_PORT", "SMTP_SECURITY", "SMTP_LOGIN", "SMTP_PASS
 MAIL_KEYS = ("MAIL_SENDER", "MAIL_RECIPIENT")
 IMAP_KEYS = ("IMAP_HOST", "IMAP_PORT", "IMAP_USER", "IMAP_PASSWORD")
 ALL_KEYS = SMTP_KEYS + MAIL_KEYS + IMAP_KEYS
+
+
+def inbox_backend(cfg: dict[str, str]) -> str:
+    """Backend di lettura:
+      - 'imap'    : casella IMAP di un gestore esterno (default)
+      - 'maildir' : Maildir locale riempito dal ricevitore self-hosted
+      - 'http'    : tira le risposte dall'endpoint /pull del ricevitore remoto
+    """
+    b = (cfg.get("INBOX_BACKEND") or "").strip().lower()
+    return b if b in ("imap", "maildir", "http") else "imap"
+
+
+def maildir_path(cfg: dict[str, str]) -> Path:
+    p = (cfg.get("MAILDIR_PATH") or "").strip()
+    return Path(p).expanduser() if p else DEFAULT_MAILDIR
+
+
+def open_maildir(cfg: dict[str, str], create: bool = True) -> mailbox.Maildir:
+    return mailbox.Maildir(str(maildir_path(cfg)), factory=None, create=create)
 
 
 def env_path() -> Path:
@@ -187,6 +208,82 @@ def _body_text(m: email.message.Message) -> str:
 
 def fetch(limit: int = 5) -> None:
     cfg = load_env()
+    backend = inbox_backend(cfg)
+    if backend == "maildir":
+        _fetch_maildir(limit, cfg)
+    elif backend == "http":
+        _fetch_http(limit, cfg)
+    else:
+        _fetch_imap(limit, cfg)
+
+
+def _fetch_http(limit: int, cfg: dict[str, str]) -> None:
+    """Tira le risposte dall'endpoint /pull del ricevitore remoto (via tunnel).
+    Il ricevitore le marca come lette. Usato dalla macchina con la CLI `claude`."""
+    import json as _json
+    import urllib.request
+
+    url = (cfg.get("PULL_URL") or "").strip()
+    token = (cfg.get("RECEIVER_TOKEN") or "").strip()
+    if not (url and token):
+        raise SystemExit(
+            "Backend http non configurato: servono PULL_URL e RECEIVER_TOKEN in "
+            f"{env_path()}."
+        )
+    req = urllib.request.Request(
+        url, data=b"", method="POST",
+        headers={
+            "Authorization": f"Bearer {token}",
+            # Cloudflare blocca lo UA di default di urllib: usane uno normale.
+            "User-Agent": "ClaudeInbox/1.0",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+        payload = _json.loads(resp.read().decode("utf-8"))
+    messages = payload.get("messages", [])
+    if not messages:
+        print("Nessuna nuova risposta.")
+        return
+    for m in messages[-limit:]:
+        print("=" * 60)
+        print(f"Da: {m.get('from','')}")
+        print(f"Oggetto: {m.get('subject','')}")
+        print(f"Data: {m.get('date','')}")
+        print(f"Message-ID: {m.get('message_id','')}")
+        print("-" * 60)
+        print((m.get("body", "") or "").strip()[:4000])
+
+
+def _print_message(m: email.message.Message) -> None:
+    frm = parseaddr(m.get("From", ""))[1]
+    print("=" * 60)
+    print(f"Da: {frm}")
+    print(f"Oggetto: {_decode(m.get('Subject'))}")
+    print(f"Data: {m.get('Date','')}")
+    print(f"Message-ID: {m.get('Message-ID','').strip()}")
+    print("-" * 60)
+    print(_body_text(m).strip()[:4000])
+
+
+def _fetch_maildir(limit: int, cfg: dict[str, str]) -> None:
+    """Legge le mail NON lette dal Maildir locale (ricevitore self-hosted) e le
+    marca come lette spostandole da new/ a cur/."""
+    md = open_maildir(cfg, create=True)
+    unread = [k for k in md.iterkeys() if md.get_message(k).get_subdir() == "new"]
+    if not unread:
+        print("Nessuna nuova risposta.")
+        return
+    for key in unread[-limit:]:
+        msg = md.get_message(key)
+        _print_message(msg)
+        # marca come letto: sposta in cur/ con flag Seen
+        msg.set_subdir("cur")
+        msg.add_flag("S")
+        md[key] = msg
+    md.flush()
+
+
+def _fetch_imap(limit: int, cfg: dict[str, str]) -> None:
     host = cfg.get("IMAP_HOST", "").strip()
     user, pw = cfg.get("IMAP_USER", ""), cfg.get("IMAP_PASSWORD", "")
     if not (host and user and pw):
@@ -208,15 +305,7 @@ def fetch(limit: int = 5) -> None:
             return
         for mid in ids[-limit:]:
             typ, raw = M.fetch(mid, "(RFC822)")
-            m = email.message_from_bytes(raw[0][1])
-            frm = parseaddr(m.get("From", ""))[1]
-            print("=" * 60)
-            print(f"Da: {frm}")
-            print(f"Oggetto: {_decode(m.get('Subject'))}")
-            print(f"Data: {m.get('Date','')}")
-            print(f"Message-ID: {m.get('Message-ID','').strip()}")
-            print("-" * 60)
-            print(_body_text(m).strip()[:4000])
+            _print_message(email.message_from_bytes(raw[0][1]))
     finally:
         _quiet_logout(M)
 
